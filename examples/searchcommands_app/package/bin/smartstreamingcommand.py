@@ -7,6 +7,7 @@ import os
 import gzip
 import re
 import csv
+import math
 import time
 import logging
 
@@ -38,7 +39,7 @@ class ChunkedInput(object):
 
 
 class SmartStreamingCommand(StreamingCommand):
-    """A smarter version of the Splunk SDK's StreamingCommand.
+    """ A smarter version of the Splunk SDK's StreamingCommand.
 
     Like the parent class, this class applies a transformation to
     search results as they travel through the streams pipeline.
@@ -46,25 +47,11 @@ class SmartStreamingCommand(StreamingCommand):
     This class adds functionality that more intelligently reads events
     from the Splunk server, reducing the memory consumption of this
     custom command when it is running.  Additionally, this class adds
-    functionality that will incrementally flush produced events, also
-    reducing the memory footprint of this command.
-
-    Finally, this class includes more careful handshaking between the
-    custom command process and the parent Splunk daemon to avoid the
-    "buffer full" Splunk daemon bug.  This includes always observing a
-    "read one chunk, send one chunk" policy and ensuring that outbound
-    chunks are never flushed at a rate faster than one event per
-    "throttleMs" milliseconds.  The default for "throttleMs" is
-    '0.08', meaning that standard batch of 50,000 events will not be
-    flushed faster than once each four seconds.
-
-    This class has been tested against the following configuration
-    dimensions:
-
-    - Single install Splunk server vs. SHC and indexer cluster (3x6)
-    - On the searchhead (eg. after `localop`) vs. on indexers in parallel
-    - With and without previews enabled
-    - Against both generating and eventing base searches 
+    support to continually monitoring and drain any continuing
+    information sent by the parent Splunk process.  Finally, this
+    class adds functionality that will incrementally flush the
+    produced events, also reducing the memory footprint of this
+    command.
 
     This class otherwise supports the same functionality and interface
     as the parent, StreamingCommand, class.
@@ -75,6 +62,7 @@ class SmartStreamingCommand(StreamingCommand):
         StreamingCommand.__init__(self)
         self._throttleMs = 0.08
         self._last_flush = None
+        self._last_count = 0
 
     @property
     def throttleMs(self):
@@ -98,7 +86,14 @@ class SmartStreamingCommand(StreamingCommand):
     # without requiring the ifile to be closed...
     def _execute(self, ifile, process):
         self.logger.setLevel(logging.INFO)
-        self._record_writer.write_records(self.stream(self._our_records(ifile)))
+
+        # Bump base class' understanding of maxresultrows by one so
+        # that we can control flushing here...
+        maxresultrows = getattr(self._metadata.searchinfo, 'maxresultrows', 50000)
+        setattr(self._metadata.searchinfo, 'maxresultrows', maxresultrows+1)
+        self._flush_count = math.floor(2*maxresultrows/3)
+
+        self._record_writer.write_records(self._metered_flush(self.stream(self._our_records(ifile))))
         self.finish()
 
     # Start reading a chunk by reading the header and returning the
@@ -160,11 +155,13 @@ class SmartStreamingCommand(StreamingCommand):
         
         file = 'input_snap_{}.gz'.format(os.getpid())
         path = os.path.join(dispatch_dir, file)
-        self.logger.info('Capture input ({} bytes) in {}...'.format(bytes,file))
+        self.logger.debug('Capture input ({} bytes) in {}...'.format(bytes,file))
         
+        count = 0
         with gzip.open(path, 'wb') as copy:
             for line in ChunkedInput(ifile, bytes):
                 copy.write(line)
+                count += 1
             copy.flush()
             copy.close()
 
@@ -172,7 +169,7 @@ class SmartStreamingCommand(StreamingCommand):
         self._icopy = gzip.open(path, 'rb')
         self._ifile = ifile
 
-        self.logger.debug('Input captured')
+        self.logger.info('Input captured ({})'.format(count))
 
     # Drain exactly one input chunk.
     def _drain_input_one_chunk(self, ifile):
@@ -214,10 +211,8 @@ class SmartStreamingCommand(StreamingCommand):
         if self._last_flush is None:
             self._last_flush = time.time()
 
-        if count is 0:
-            return
-        
-        intervalSec = self.throttleMs * count / 1000.0
+        max = count if count > self._last_count else self._last_count
+        intervalSec = self.throttleMs * max / 1000.0
         timeSec = time.time()
 
         # Check if we have flushed recently; iff so, stall briefly...
@@ -229,6 +224,7 @@ class SmartStreamingCommand(StreamingCommand):
         self.logger.info('Flushing events ({})...'.format(count))
         self.flush()
         self._last_flush = time.time()
+        self._last_count = count
         self.logger.debug('Flushed')
 
     # Generator function that captures input, then reads the captured
@@ -300,31 +296,37 @@ class SmartStreamingCommand(StreamingCommand):
     # from base class.
     def _our_records(self, ifile):
 
-        maxresultrows = getattr(self._metadata.searchinfo, 'maxresultrows', 50000)
-
         self._finished = False
-        total_count = 0
+        self._tot_count = 0
+        self._cur_count = 0
         while not self._finished:
 
             self.logger.debug('Read one chunk...')
 
-            count = 0
             for record in self._one_chunk_of_records(ifile):
-                count += 1
                 yield record
 
-                if count % maxresultrows == 0:
-                    self._gated_flush(maxresultrows)
-                    self._drain_input_one_chunk(self._ifile)
-                    self.logger.info('Read one input chunk')
+            self._tot_count += self._cur_count
+            self._gated_flush(self._cur_count)
+            self.logger.info('Done one chunk ({}/{} returned).'.format(self._cur_count, self._tot_count))
+            self._cur_count = 0
 
-            self._gated_flush(count % maxresultrows)
-            self.logger.info('Done one chunk ({}).'.format(count))
-
-            total_count += count
-
-        self.logger.info('Done with all records ({})'.format(total_count))
+        self.logger.info('Done with all records ({} returned)'.format(self._tot_count))
 
         self.logger.debug('Read remaining chunks...sleep {}s first'.format(1))
         time.sleep(1)
         self._drain_input(ifile)
+
+    def _metered_flush(self, events):
+
+        for event in events:
+            self._cur_count += 1
+            yield event
+
+            if self._cur_count % self._flush_count == 0:
+                self._tot_count += self._cur_count
+                if self._cur_count > 0:
+                    self._gated_flush(self._cur_count)
+                    self._drain_input_one_chunk(self._ifile)
+                    self.logger.info('Read one input chunk')
+                self._cur_count = 0
