@@ -47,11 +47,28 @@ class SmartStreamingCommand(StreamingCommand):
     This class adds functionality that more intelligently reads events
     from the Splunk server, reducing the memory consumption of this
     custom command when it is running.  Additionally, this class adds
-    support to continually monitoring and drain any continuing
+    support to continually monitor and drain any continuing
     information sent by the parent Splunk process.  Finally, this
     class adds functionality that will incrementally flush the
     produced events, also reducing the memory footprint of this
     command.
+
+    Finally, this class includes more careful handshaking between the
+    custom command process and the parent Splunk daemon to avoid the
+    "buffer full" Splunk daemon bug.  This includes always observing a
+    "read one chunk, send one chunk" policy and ensuring that outbound
+    chunks are never flushed at a rate faster than one event per
+    "throttleMs" milliseconds.  The default for "throttleMs" is
+    '0.08', meaning that standard batch of 50,000 events will not be
+    flushed faster than once each four seconds.
+
+    This class has been tested against the following configuration
+    dimensions:
+
+    - Single install Splunk server vs. SHC and indexer cluster (3x6)
+    - On the searchhead (eg. after `localop`) vs. on indexers in parallel
+    - With and without previews enabled
+    - Against both generating and eventing base searches 
 
     This class otherwise supports the same functionality and interface
     as the parent, StreamingCommand, class.
